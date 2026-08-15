@@ -1,0 +1,25 @@
+schema: mcpg.dev/plugin/v1
+id: dev.mcpg.credential.oauth-token-exchange
+name: OAuth 2.0 Token Exchange Issuer
+license: BUSL-1.1
+description: |
+  Outbound OAuth 2.0 token-exchange issuer (RFC 8693). Exchanges the
+  *caller's* subject token for a downstream access token so the gateway
+  can act on-behalf-of the end user (impersonation). The caller's subject
+  token is read from the resolved identity's `attributes["subject_token"]`
+  (federation's `oauth_impersonation` mode populates it from the inbound
+  bearer); `subject_token_type` may be supplied the same way or defaults
+  per provider. Operators declare N named providers (STS token endpoint +
+  client_id + optional client_secret + token-type/audience). Bindings +
+  federations reference an exchanged token via
+  `cred://dev.mcpg.credential.oauth-token-exchange/<provider>`.
+
+  No in-plugin token cache: tokens are per-caller (each subject token
+  yields a distinct exchange), so caching is left to the host credential
+  cache, which is keyed per (identity, plugin, target). A provider-keyed
+  in-plugin cache would leak one caller's token to another.
+class: credential_issuer
+runtime: native-cdylib-v1
+protocol_version: "1.0"
+required_capabilities:
+  - network_outbound
