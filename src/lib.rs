@@ -6,13 +6,32 @@
 //! Operators declare named STS providers; callers reference an exchanged
 //! token via `cred://<plugin_id>/<provider>`.
 //!
+//! The plugin authenticates to the STS with `client_secret_post`,
+//! `client_secret_basic` or `private_key_jwt`. The token endpoint must be
+//! https and must not resolve to a private address unless the provider
+//! opts in.
+//!
 //! ## Subject token
 //!
 //! The subject token to exchange is read from the resolved identity's
-//! `attributes["subject_token"]` (and `subject_token_type`, falling back
-//! to the provider default). Federation's `oauth_impersonation` mode
-//! populates these from the inbound caller bearer. The subject token is
-//! used transiently and never logged.
+//! `attributes["subject_token"]`; its type is the provider's
+//! `subject_token_type` unless `attributes["subject_token_type"]`
+//! overrides it. Federation's `oauth_impersonation` mode populates the
+//! token from the inbound caller bearer. A bearer the gateway process
+//! minted (`auth_provider` `ema` or `inspector_supervisor`, or any
+//! `attributes["token_issuer"]`) is refused: no external STS can validate
+//! it.
+//!
+//! The exception is a subject token from the caller's enterprise IdP
+//! sign-in the gateway keeps (`attributes["subject_token_source"] =
+//! "idp_vault"`), whatever bearer the caller presented. It is exchanged
+//! only at the token endpoint that issued it, by the client it was issued
+//! to: `attributes["subject_token_endpoint"]` must equal `token_url`,
+//! `attributes["subject_token_client_id"]` must equal `client_id`, and,
+//! when `sts_issuer` is set, `attributes["subject_token_issuer"]` must
+//! equal it. Otherwise the call is refused before any request.
+//!
+//! The subject token is used transiently and never logged.
 //!
 //! ## No in-plugin cache
 //!
@@ -23,7 +42,9 @@
 //! omitted; every `issue` performs a fresh exchange and the host cache
 //! deduplicates per caller.
 
+mod client_auth;
 mod config;
+mod egress;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
@@ -38,7 +59,12 @@ use mcpg_plugin_sdk::ffi::SyncCredentialIssuer;
 use serde_json::Value;
 use tokio::runtime::Runtime;
 
-pub use config::{ConfigError, ProviderConfig, TokenExchangeConfig, TokenExchangeTargetTemplate};
+use client_auth::ClientAuth;
+pub use client_auth::{AssertionAudience, ClientAuthMethod, SigningAlg};
+pub use config::{
+    ConfigError, ExpandError, ProviderConfig, TokenExchangeConfig, TokenExchangeTargetTemplate,
+    normalize_token_type, target_slug,
+};
 
 const PLUGIN_ID: &str = "dev.mcpg.credential.oauth-token-exchange";
 
@@ -51,6 +77,66 @@ const GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const SUBJECT_TOKEN_ATTR: &str = "subject_token";
 /// Optional per-request override of the subject token's type.
 const SUBJECT_TOKEN_TYPE_ATTR: &str = "subject_token_type";
+
+/// `auth_provider` values of callers whose bearer the gateway process
+/// minted: the embedded authorization server and the supervised inspector.
+const GATEWAY_MINTED_AUTH_PROVIDERS: [&str; 2] = ["ema", "inspector_supervisor"];
+/// Attribute the embedded authorization server sets on every caller of a
+/// token it minted. A `principal_issuer` alias rewrites `auth_provider`
+/// but leaves this in place.
+const TOKEN_ISSUER_ATTR: &str = "token_issuer";
+/// Attribute naming where the subject token came from.
+const SUBJECT_TOKEN_SOURCE_ATTR: &str = "subject_token_source";
+/// The caller's enterprise IdP sign-in the gateway stored: an IdP token,
+/// exchangeable even when the caller presented a gateway-minted bearer.
+const SUBJECT_TOKEN_SOURCE_IDP_VAULT: &str = "idp_vault";
+/// The token endpoint, client and issuer a stored sign-in was issued by.
+const SUBJECT_TOKEN_ENDPOINT_ATTR: &str = "subject_token_endpoint";
+const SUBJECT_TOKEN_CLIENT_ID_ATTR: &str = "subject_token_client_id";
+const SUBJECT_TOKEN_ISSUER_ATTR: &str = "subject_token_issuer";
+
+fn is_gateway_minted(identity: &PluginIdentity) -> bool {
+    let minted_provider = identity.auth_provider.as_deref().is_some_and(|p| {
+        GATEWAY_MINTED_AUTH_PROVIDERS
+            .iter()
+            .any(|minted| p.eq_ignore_ascii_case(minted))
+    });
+    minted_provider || identity.attributes.contains_key(TOKEN_ISSUER_ATTR)
+}
+
+fn from_idp_vault(identity: &PluginIdentity) -> bool {
+    identity
+        .attributes
+        .get(SUBJECT_TOKEN_SOURCE_ATTR)
+        .is_some_and(|source| source == SUBJECT_TOKEN_SOURCE_IDP_VAULT)
+}
+
+/// Refuse a stored-sign-in subject token that `provider` would send to
+/// another token endpoint than the one that issued it, or present with
+/// another client.
+fn check_idp_vault_binding(
+    provider_name: &str,
+    provider: &ProviderConfig,
+    identity: &PluginIdentity,
+) -> Result<(), CredentialError> {
+    let attribute = |name: &str| identity.attributes.get(name).map(String::as_str);
+    let bound = attribute(SUBJECT_TOKEN_ENDPOINT_ATTR) == Some(provider.token_url.as_str())
+        && attribute(SUBJECT_TOKEN_CLIENT_ID_ATTR) == Some(provider.client_id.as_str())
+        && provider
+            .sts_issuer
+            .as_deref()
+            .is_none_or(|issuer| attribute(SUBJECT_TOKEN_ISSUER_ATTR) == Some(issuer));
+    if bound {
+        return Ok(());
+    }
+    Err(CredentialError::Misconfigured {
+        reason: format!(
+            "token exchange for `{provider_name}`: the stored enterprise sign-in may only be \
+             exchanged at the IdP that issued it, by the client it was issued to; token_url and \
+             client_id must be the gateway's login client's, and sts_issuer, when set, its IdP"
+        ),
+    })
+}
 
 #[derive(serde::Deserialize)]
 struct TokenExchangeResponse {
@@ -74,38 +160,70 @@ pub struct OAuthTokenExchangePlugin {
 struct Inner {
     manifest: PluginManifest,
     config: TokenExchangeConfig,
-    http_client: reqwest::Client,
+    provider_auth: BTreeMap<String, Arc<ClientAuth>>,
+    template_auth: Option<Arc<ClientAuth>>,
+    /// Refuses private, loopback and link-local destinations.
+    guarded_client: reqwest::Client,
+    /// For providers with `allow_private_network: true`.
+    open_client: reqwest::Client,
     /// Tokio runtime for the SyncCredentialIssuer FFI path; lazily built
     /// on first sync call (see the client_credentials issuer for rationale).
     sync_runtime: OnceLock<Runtime>,
 }
 
+impl Inner {
+    fn client(&self, provider: &ProviderConfig) -> &reqwest::Client {
+        if provider.allow_private_network {
+            &self.open_client
+        } else {
+            &self.guarded_client
+        }
+    }
+}
+
+fn refuse_to_load(err: &dyn std::fmt::Display) -> ! {
+    tracing::error!(
+        plugin_id = PLUGIN_ID,
+        error = %err,
+        "oauth-token-exchange: config parse failed; refusing to register"
+    );
+    panic!(
+        "oauth-token-exchange config parse failed: {err}. A misconfigured \
+         credential issuer is a security hole; refusing to load."
+    )
+}
+
 impl OAuthTokenExchangePlugin {
     pub fn from_config_json(config_json: &str) -> Self {
-        let cfg = TokenExchangeConfig::parse(config_json).unwrap_or_else(|err| {
-            tracing::error!(
-                plugin_id = PLUGIN_ID,
-                error = %err,
-                "oauth-token-exchange: config parse failed; refusing to register"
-            );
-            panic!(
-                "oauth-token-exchange config parse failed: {err}. A misconfigured \
-                 credential issuer is a security hole; refusing to load."
-            )
-        });
-        Self::from_validated_config(cfg)
+        let cfg =
+            TokenExchangeConfig::parse(config_json).unwrap_or_else(|err| refuse_to_load(&err));
+        Self::from_validated_config(cfg).unwrap_or_else(|err| refuse_to_load(&err))
     }
 
-    fn from_validated_config(cfg: TokenExchangeConfig) -> Self {
-        let http_client = reqwest::Client::builder()
-            .build()
-            .expect("oauth-token-exchange: failed to build HTTP client");
+    fn from_validated_config(cfg: TokenExchangeConfig) -> Result<Self, String> {
+        let mut provider_auth = BTreeMap::new();
+        for (name, provider) in &cfg.providers {
+            let auth = provider
+                .client_auth()
+                .map_err(|e| format!("provider `{name}` {e}"))?;
+            provider_auth.insert(name.clone(), Arc::new(auth));
+        }
+        let template_auth = match &cfg.target_template {
+            Some(template) => {
+                let probe = template.probe().map_err(|e| e.to_string())?;
+                let auth = probe
+                    .client_auth()
+                    .map_err(|e| format!("target_template {e}"))?;
+                Some(Arc::new(auth))
+            }
+            None => None,
+        };
         tracing::info!(
             plugin_id = PLUGIN_ID,
             provider_count = cfg.providers.len(),
             "oauth-token-exchange: configured"
         );
-        Self {
+        Ok(Self {
             inner: Arc::new(Inner {
                 manifest: PluginManifest {
                     id: PLUGIN_ID.into(),
@@ -126,10 +244,13 @@ impl OAuthTokenExchangePlugin {
                     backend_profile: None,
                 },
                 config: cfg,
-                http_client,
+                provider_auth,
+                template_auth,
+                guarded_client: egress::build_client(true),
+                open_client: egress::build_client(false),
                 sync_runtime: OnceLock::new(),
             }),
-        }
+        })
     }
 }
 
@@ -166,6 +287,42 @@ impl CallOverrides {
     }
 }
 
+fn unknown_provider(provider_name: &str) -> CredentialError {
+    CredentialError::Misconfigured {
+        reason: format!(
+            "unknown provider `{provider_name}` (no exact entry; target_template \
+             absent or target not in allowed_targets)"
+        ),
+    }
+}
+
+/// The provider for `provider_name` and its compiled client authentication.
+/// Exact provider entries win; the fleet template serves allowlisted
+/// targets; anything else fails closed.
+fn resolve_provider(
+    inner: &Inner,
+    provider_name: &str,
+) -> Result<(ProviderConfig, Arc<ClientAuth>), CredentialError> {
+    if let Some(provider) = inner.config.providers.get(provider_name) {
+        let auth = inner
+            .provider_auth
+            .get(provider_name)
+            .cloned()
+            .ok_or_else(|| unknown_provider(provider_name))?;
+        return Ok((provider.clone(), auth));
+    }
+    let (Some(template), Some(auth)) = (&inner.config.target_template, &inner.template_auth) else {
+        return Err(unknown_provider(provider_name));
+    };
+    match template.expand(provider_name) {
+        Ok(provider) => Ok((provider, Arc::clone(auth))),
+        Err(ExpandError::NotAllowed(_)) => Err(unknown_provider(provider_name)),
+        Err(e) => Err(CredentialError::Misconfigured {
+            reason: e.to_string(),
+        }),
+    }
+}
+
 async fn issue_inner(
     inner: &Inner,
     identity: &PluginIdentity,
@@ -192,23 +349,25 @@ async fn issue_inner(
         });
     }
 
-    // Exact provider entry wins; otherwise derive one from the fleet
-    // template when the target is allowlisted. Fail closed on anything else.
-    let provider = match inner.config.providers.get(provider_name) {
-        Some(p) => p.clone(),
-        None => inner
-            .config
-            .target_template
-            .as_ref()
-            .and_then(|t| t.expand(provider_name))
-            .ok_or_else(|| CredentialError::Misconfigured {
-                reason: format!(
-                    "unknown provider `{provider_name}` (no exact entry; target_template \
-                     absent or target not in allowed_targets)"
-                ),
-            })?,
-    };
+    // A bearer the gateway minted is valid only at this gateway, so posting
+    // one to an STS can never succeed and hands a live gateway credential to
+    // a third party. A stored IdP sign-in is an IdP token whoever the caller
+    // is, and is checked against the provider below instead.
+    let from_vault = from_idp_vault(identity);
+    if !from_vault && is_gateway_minted(identity) {
+        return Err(CredentialError::Misconfigured {
+            reason: format!(
+                "token exchange for `{provider_name}`: a token minted by this gateway \
+                 cannot be exchanged at an external token service"
+            ),
+        });
+    }
+
+    let (provider, auth) = resolve_provider(inner, provider_name)?;
     let provider = CallOverrides::parse(call_config)?.apply(provider);
+    if from_vault {
+        check_idp_vault_binding(provider_name, &provider, identity)?;
+    }
 
     let subject_token = identity
         .attributes
@@ -221,18 +380,23 @@ async fn issue_inner(
                  identity.attributes[\"{SUBJECT_TOKEN_ATTR}\"]"
             ),
         })?;
-    let subject_token_type = identity
-        .attributes
-        .get(SUBJECT_TOKEN_TYPE_ATTR)
-        .map(String::as_str)
-        .unwrap_or(provider.subject_token_type.as_str());
+    let subject_token_type = match identity.attributes.get(SUBJECT_TOKEN_TYPE_ATTR) {
+        Some(raw) => normalize_token_type(raw).ok_or_else(|| CredentialError::Misconfigured {
+            reason: format!(
+                "token exchange for `{provider_name}`: identity.attributes\
+                 [\"{SUBJECT_TOKEN_TYPE_ATTR}\"] is not a supported token type"
+            ),
+        })?,
+        None => provider.subject_token_type.clone(),
+    };
 
     exchange(
         inner,
         provider_name,
         &provider,
+        &auth,
         subject_token,
-        subject_token_type,
+        &subject_token_type,
     )
     .await
 }
@@ -241,45 +405,71 @@ async fn exchange(
     inner: &Inner,
     provider_name: &str,
     provider: &ProviderConfig,
+    auth: &ClientAuth,
     subject_token: &str,
     subject_token_type: &str,
 ) -> Result<IssuedCredential, CredentialError> {
-    let timeout = Duration::from_millis(provider.timeout_ms);
-    let scope_joined = provider.scopes.join(" ");
-    let mut form: Vec<(&str, &str)> = vec![
-        ("grant_type", GRANT_TYPE),
-        ("subject_token", subject_token),
-        ("subject_token_type", subject_token_type),
+    egress::check_endpoint(&provider.token_url, provider.egress()).map_err(|reason| {
+        CredentialError::Misconfigured {
+            reason: format!("token-exchange endpoint for `{provider_name}` {reason}"),
+        }
+    })?;
+    let mut form: Vec<(&'static str, String)> = vec![
+        ("grant_type", GRANT_TYPE.to_owned()),
+        ("subject_token", subject_token.to_owned()),
+        ("subject_token_type", subject_token_type.to_owned()),
         (
             "requested_token_type",
-            provider.requested_token_type.as_str(),
+            provider.requested_token_type.clone(),
         ),
-        ("client_id", provider.client_id.as_str()),
     ];
-    if let Some(secret) = provider.client_secret.as_deref().filter(|s| !s.is_empty()) {
-        form.push(("client_secret", secret));
-    }
     if !provider.scopes.is_empty() {
-        form.push(("scope", scope_joined.as_str()));
+        form.push(("scope", provider.scopes.join(" ")));
     }
     if let Some(aud) = provider.audience.as_deref() {
-        form.push(("audience", aud));
+        form.push(("audience", aud.to_owned()));
     }
     if let Some(res) = provider.resource.as_deref() {
-        form.push(("resource", res));
+        form.push(("resource", res.to_owned()));
+    }
+    if let (Some(token), Some(token_type)) = (
+        provider.actor_token.as_deref().filter(|t| !t.is_empty()),
+        provider.actor_token_type.as_deref(),
+    ) {
+        form.push(("actor_token", token.to_owned()));
+        form.push(("actor_token_type", token_type.to_owned()));
     }
 
-    let started = Instant::now();
-    let response = inner
-        .http_client
+    let request = inner
+        .client(provider)
         .post(&provider.token_url)
-        .timeout(timeout)
-        .form(&form)
-        .send()
-        .await
-        .map_err(|e| CredentialError::Backend {
-            reason: format!("token-exchange endpoint unreachable for `{provider_name}`: {e}"),
+        .timeout(Duration::from_millis(provider.timeout_ms));
+    let request = auth
+        .authenticate(
+            request,
+            &mut form,
+            &provider.token_url,
+            provider.sts_issuer.as_deref(),
+        )
+        .map_err(|reason| CredentialError::Misconfigured {
+            reason: format!("token-exchange client authentication for `{provider_name}`: {reason}"),
         })?;
+
+    let started = Instant::now();
+    let response = request.form(&form).send().await.map_err(|e| {
+        if egress::is_private_address_refusal(&e) {
+            CredentialError::Misconfigured {
+                reason: format!(
+                    "token-exchange endpoint for `{provider_name}` resolves only to private, \
+                     loopback or link-local addresses (set allow_private_network: true to permit)"
+                ),
+            }
+        } else {
+            CredentialError::Backend {
+                reason: format!("token-exchange endpoint unreachable for `{provider_name}`: {e}"),
+            }
+        }
+    })?;
     let elapsed_ms = started.elapsed().as_millis() as u64;
     metrics::histogram!(
         "mcpg_oauth_token_exchange_latency_ms",
@@ -295,8 +485,7 @@ async fn exchange(
             .unwrap_or_else(|_| "<unreadable>".to_owned());
         // SECURITY: never embed the raw token-endpoint response body in the
         // error reason. It is upstream-internal detail that propagates into
-        // logs / audit (and, before the federation-error opacity fix, toward
-        // callers), and a misbehaving STS could echo the caller's subject
+        // logs / audit, and a misbehaving STS could echo the caller's subject
         // token or other secrets into it. Surface only the standard
         // RFC 6749 §5.2 `error` code (a fixed, non-sensitive enum) when the
         // body parses as an OAuth error response; otherwise just status +
@@ -322,6 +511,12 @@ async fn exchange(
         )
         .increment(1);
         return Err(match status.as_u16() {
+            300..=399 => CredentialError::Misconfigured {
+                reason: format!(
+                    "token-exchange endpoint for `{provider_name}` redirected (HTTP {status}); \
+                     redirects are not followed, configure the final URL"
+                ),
+            },
             429 => CredentialError::Throttled { reason },
             // 4xx is a config / subject-token problem — not retryable.
             400..=499 => CredentialError::Misconfigured { reason },
@@ -434,9 +629,15 @@ declare_plugin! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jsonwebtoken::{Algorithm, DecodingKey, Validation};
     use serde_json::json;
-    use wiremock::matchers::{body_string_contains, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::matchers::{any, body_string_contains, header, method, path};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    const RSA_PRIV: &str = include_str!("../tests/fixtures/rsa_priv.pem");
+    const RSA_PUB: &str = include_str!("../tests/fixtures/rsa_pub.pem");
+    const EC_PRIV: &str = include_str!("../tests/fixtures/ec_priv.pem");
+    const EC_PUB: &str = include_str!("../tests/fixtures/ec_pub.pem");
 
     /// Identity carrying a subject token in `attributes` — what federation
     /// `oauth_impersonation` builds from the inbound caller bearer.
@@ -449,7 +650,7 @@ mod tests {
             kind: "verified".into(),
             trust_level: "verified".into(),
             subject_id: Some("alice".into()),
-            auth_provider: None,
+            auth_provider: Some("oidc".into()),
             issuer: None,
             roles: vec![],
             groups: vec![],
@@ -458,19 +659,66 @@ mod tests {
         }
     }
 
-    fn build_with_token_url(url: &str) -> OAuthTokenExchangePlugin {
-        let cfg = json!({
+    /// The `notion` provider pointed at `url`. A wiremock server listens on
+    /// loopback over plain http, so both egress opt-ins are set.
+    fn notion_config(url: &str) -> Value {
+        json!({
             "providers": {
                 "notion": {
                     "token_url": url,
                     "client_id": "mcpg",
                     "client_secret": "csecret",
                     "audience": "https://notion-mcp.example.com",
-                    "scopes": ["read"]
+                    "scopes": ["read"],
+                    "allow_insecure_http": true,
+                    "allow_private_network": true
                 }
             }
-        });
-        OAuthTokenExchangePlugin::from_config_json(&cfg.to_string())
+        })
+    }
+
+    fn build_with_token_url(url: &str) -> OAuthTokenExchangePlugin {
+        OAuthTokenExchangePlugin::from_config_json(&notion_config(url).to_string())
+    }
+
+    fn exchanged() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "exchanged-tok",
+            "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+            "token_type": "Bearer",
+            "expires_in": 600
+        }))
+    }
+
+    async fn form_sent(server: &MockServer) -> BTreeMap<String, String> {
+        let requests: Vec<Request> = server.received_requests().await.unwrap();
+        let request = requests.first().expect("one request");
+        url::form_urlencoded::parse(&request.body)
+            .into_owned()
+            .collect()
+    }
+
+    fn decode_assertion(
+        form: &BTreeMap<String, String>,
+        alg: Algorithm,
+        key: &DecodingKey,
+        aud: &str,
+    ) -> Value {
+        assert_eq!(
+            form.get("client_assertion_type").map(String::as_str),
+            Some("urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
+        );
+        assert!(!form.contains_key("client_secret"));
+        let mut validation = Validation::new(alg);
+        validation.set_audience(&[aud]);
+        validation.set_issuer(&["mcpg"]);
+        let claims = jsonwebtoken::decode::<Value>(&form["client_assertion"], key, &validation)
+            .expect("client assertion verifies")
+            .claims;
+        assert_eq!(claims["sub"], "mcpg");
+        let lifetime = claims["exp"].as_u64().unwrap() - claims["iat"].as_u64().unwrap();
+        assert!(lifetime <= 300, "lifetime {lifetime}s exceeds five minutes");
+        claims
     }
 
     #[test]
@@ -496,13 +744,9 @@ mod tests {
             ))
             .and(body_string_contains("subject_token=caller-bearer-xyz"))
             .and(body_string_contains("client_id=mcpg"))
+            .and(body_string_contains("client_secret=csecret"))
             .and(body_string_contains("audience="))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "access_token": "exchanged-tok",
-                "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
-                "token_type": "Bearer",
-                "expires_in": 600
-            })))
+            .respond_with(exchanged())
             .expect(1)
             .mount(&server)
             .await;
@@ -526,6 +770,363 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_secret_basic_uses_the_header_only() {
+        let server = MockServer::start().await;
+        // base64("mcpg:csecret")
+        Mock::given(path("/token"))
+            .and(header("authorization", "Basic bWNwZzpjc2VjcmV0"))
+            .respond_with(exchanged())
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut cfg = notion_config(&format!("{}/token", server.uri()));
+        cfg["providers"]["notion"]["client_auth"] = json!("client_secret_basic");
+        let plugin = OAuthTokenExchangePlugin::from_config_json(&cfg.to_string());
+        CredentialIssuer::issue(&plugin, &identity_with_subject("tok"), "notion", &json!({}))
+            .await
+            .unwrap();
+        let form = form_sent(&server).await;
+        assert!(!form.contains_key("client_id") && !form.contains_key("client_secret"));
+    }
+
+    #[tokio::test]
+    async fn private_key_jwt_targets_the_token_endpoint() {
+        let server = MockServer::start().await;
+        Mock::given(path("/token"))
+            .respond_with(exchanged())
+            .expect(1)
+            .mount(&server)
+            .await;
+        let token_url = format!("{}/token", server.uri());
+        let mut cfg = notion_config(&token_url);
+        let notion = cfg["providers"]["notion"].as_object_mut().unwrap();
+        notion.remove("client_secret");
+        notion.insert("client_auth".into(), json!("private_key_jwt"));
+        notion.insert("private_key".into(), json!(RSA_PRIV));
+        notion.insert("key_id".into(), json!("sts-key-1"));
+        let plugin = OAuthTokenExchangePlugin::from_config_json(&cfg.to_string());
+        CredentialIssuer::issue(&plugin, &identity_with_subject("tok"), "notion", &json!({}))
+            .await
+            .unwrap();
+        let form = form_sent(&server).await;
+        let claims = decode_assertion(
+            &form,
+            Algorithm::RS256,
+            &DecodingKey::from_rsa_pem(RSA_PUB.as_bytes()).unwrap(),
+            &token_url,
+        );
+        assert!(claims["jti"].as_str().is_some_and(|j| !j.is_empty()));
+        let header = jsonwebtoken::decode_header(&form["client_assertion"]).unwrap();
+        assert_eq!(header.kid.as_deref(), Some("sts-key-1"));
+    }
+
+    #[tokio::test]
+    async fn private_key_jwt_can_target_the_sts_issuer() {
+        let server = MockServer::start().await;
+        Mock::given(path("/token"))
+            .respond_with(exchanged())
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut cfg = notion_config(&format!("{}/token", server.uri()));
+        let notion = cfg["providers"]["notion"].as_object_mut().unwrap();
+        notion.remove("client_secret");
+        notion.insert("client_auth".into(), json!("private_key_jwt"));
+        notion.insert("private_key".into(), json!(EC_PRIV));
+        notion.insert("signing_alg".into(), json!("ES256"));
+        notion.insert("assertion_audience".into(), json!("issuer"));
+        notion.insert("sts_issuer".into(), json!("https://sts.example.com"));
+        let plugin = OAuthTokenExchangePlugin::from_config_json(&cfg.to_string());
+        CredentialIssuer::issue(&plugin, &identity_with_subject("tok"), "notion", &json!({}))
+            .await
+            .unwrap();
+        decode_assertion(
+            &form_sent(&server).await,
+            Algorithm::ES256,
+            &DecodingKey::from_ec_pem(EC_PUB.as_bytes()).unwrap(),
+            "https://sts.example.com",
+        );
+    }
+
+    #[tokio::test]
+    async fn actor_token_is_sent_when_configured() {
+        let server = MockServer::start().await;
+        Mock::given(path("/token"))
+            .and(body_string_contains("actor_token=gateway-actor"))
+            .and(body_string_contains(
+                "actor_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Ajwt",
+            ))
+            .respond_with(exchanged())
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut cfg = notion_config(&format!("{}/token", server.uri()));
+        cfg["providers"]["notion"]["actor_token"] = json!("gateway-actor");
+        cfg["providers"]["notion"]["actor_token_type"] = json!("jwt");
+        let plugin = OAuthTokenExchangePlugin::from_config_json(&cfg.to_string());
+        CredentialIssuer::issue(&plugin, &identity_with_subject("tok"), "notion", &json!({}))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn gateway_minted_caller_is_refused_without_any_request() {
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let plugin = build_with_token_url(&format!("{}/token", server.uri()));
+        for provider in ["ema", "inspector_supervisor", "Inspector_Supervisor"] {
+            let mut identity = identity_with_subject("gateway-minted-token");
+            identity.auth_provider = Some(provider.into());
+            let err = CredentialIssuer::issue(&plugin, &identity, "notion", &json!({}))
+                .await
+                .unwrap_err();
+            match err {
+                CredentialError::Misconfigured { reason } => {
+                    assert!(
+                        reason.contains("a token minted by this gateway cannot be exchanged"),
+                        "{provider}: {reason}"
+                    );
+                    assert!(!reason.contains("gateway-minted-token"), "{reason}");
+                }
+                other => panic!("{provider}: unexpected error: {other:?}"),
+            }
+        }
+    }
+
+    /// An EMA caller whose IdP sets `principal_issuer` reports the SSO
+    /// provider's `auth_provider`; the `token_issuer` attribute still marks
+    /// its bearer as gateway-minted.
+    #[tokio::test]
+    async fn token_issuer_attribute_is_refused_without_any_request() {
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let plugin = build_with_token_url(&format!("{}/token", server.uri()));
+        let sources = [None, Some("caller_bearer"), Some("IDP_VAULT"), Some("")];
+        for source in sources {
+            let mut identity = identity_with_subject("gateway-minted-token");
+            identity.auth_provider = Some("oidc_oauth:https://acme.okta.com/oauth2/default".into());
+            identity.attributes.insert(
+                TOKEN_ISSUER_ATTR.to_owned(),
+                "https://mcp.acme.example".to_owned(),
+            );
+            if let Some(source) = source {
+                identity
+                    .attributes
+                    .insert(SUBJECT_TOKEN_SOURCE_ATTR.to_owned(), source.to_owned());
+            }
+            let err = CredentialIssuer::issue(&plugin, &identity, "notion", &json!({}))
+                .await
+                .unwrap_err();
+            match err {
+                CredentialError::Misconfigured { reason } => {
+                    assert!(
+                        reason.contains("a token minted by this gateway cannot be exchanged"),
+                        "{source:?}: {reason}"
+                    );
+                    assert!(!reason.contains("gateway-minted-token"), "{reason}");
+                }
+                other => panic!("{source:?}: unexpected error: {other:?}"),
+            }
+        }
+    }
+
+    /// A caller the gateway minted a token for, whose subject token is the
+    /// refresh token of their stored IdP sign-in at `token_url`, issued to
+    /// the provider's `client_id`.
+    fn idp_vault_identity(token_url: &str, auth_provider: &str) -> PluginIdentity {
+        let mut identity = identity_with_subject("idp-refresh-token");
+        identity.auth_provider = Some(auth_provider.into());
+        for (name, value) in [
+            (TOKEN_ISSUER_ATTR, "https://mcp.acme.example"),
+            (SUBJECT_TOKEN_SOURCE_ATTR, SUBJECT_TOKEN_SOURCE_IDP_VAULT),
+            (
+                SUBJECT_TOKEN_TYPE_ATTR,
+                "urn:ietf:params:oauth:token-type:refresh_token",
+            ),
+            (SUBJECT_TOKEN_ENDPOINT_ATTR, token_url),
+            (SUBJECT_TOKEN_CLIENT_ID_ATTR, "mcpg"),
+            (SUBJECT_TOKEN_ISSUER_ATTR, "https://sts.example.com"),
+            ("subject_token_binding", "vault:p:mcpg:refresh_token"),
+        ] {
+            identity
+                .attributes
+                .insert(name.to_owned(), value.to_owned());
+        }
+        identity
+    }
+
+    /// A subject token from the stored IdP sign-in is an IdP token, so it
+    /// is exchanged for a caller whose bearer the gateway minted, at the
+    /// token endpoint and with the client that issued it.
+    #[tokio::test]
+    async fn idp_vault_subject_token_is_exchanged_for_a_gateway_minted_caller() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("subject_token=idp-refresh-token"))
+            .and(body_string_contains(
+                "subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Arefresh_token",
+            ))
+            .respond_with(exchanged())
+            .expect(3)
+            .mount(&server)
+            .await;
+        let token_url = format!("{}/token", server.uri());
+        let plugin = build_with_token_url(&token_url);
+        for auth_provider in [
+            "ema",
+            "inspector_supervisor",
+            "oidc_oauth:https://sso.example",
+        ] {
+            let identity = idp_vault_identity(&token_url, auth_provider);
+            let cred = CredentialIssuer::issue(&plugin, &identity, "notion", &json!({}))
+                .await
+                .unwrap_or_else(|e| panic!("{auth_provider}: {e:?}"));
+            assert_eq!(cred.value.as_deref(), Some("exchanged-tok"));
+        }
+    }
+
+    /// The stored sign-in goes to no other token endpoint than the one that
+    /// issued it, with no other client, and from no other IdP than the
+    /// provider's `sts_issuer`; a vault token without those attributes is
+    /// refused too. Nothing is sent.
+    #[tokio::test]
+    async fn idp_vault_subject_token_bound_elsewhere_is_refused_without_any_request() {
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let token_url = format!("{}/token", server.uri());
+        let mut config = notion_config(&token_url);
+        config["providers"]["notion"]["sts_issuer"] = json!("https://sts.example.com");
+        let plugin = OAuthTokenExchangePlugin::from_config_json(&config.to_string());
+        let cases: [(&str, Option<String>); 7] = [
+            (
+                SUBJECT_TOKEN_ENDPOINT_ATTR,
+                Some(format!("{}/other", server.uri())),
+            ),
+            (SUBJECT_TOKEN_ENDPOINT_ATTR, Some(format!("{token_url}/"))),
+            (SUBJECT_TOKEN_ENDPOINT_ATTR, None),
+            (
+                SUBJECT_TOKEN_CLIENT_ID_ATTR,
+                Some("another-client".to_owned()),
+            ),
+            (SUBJECT_TOKEN_CLIENT_ID_ATTR, None),
+            (
+                SUBJECT_TOKEN_ISSUER_ATTR,
+                Some("https://other-idp.example".to_owned()),
+            ),
+            (SUBJECT_TOKEN_ISSUER_ATTR, None),
+        ];
+        for (attribute, value) in cases {
+            let mut identity = idp_vault_identity(&token_url, "ema");
+            match value {
+                Some(ref value) => {
+                    identity
+                        .attributes
+                        .insert(attribute.to_owned(), value.clone());
+                }
+                None => {
+                    identity.attributes.remove(attribute);
+                }
+            }
+            match CredentialIssuer::issue(&plugin, &identity, "notion", &json!({})).await {
+                Err(CredentialError::Misconfigured { reason }) => {
+                    assert!(
+                        reason.contains("may only be exchanged at the IdP that issued it"),
+                        "{attribute}={value:?}: {reason}"
+                    );
+                    assert!(!reason.contains("idp-refresh-token"), "{reason}");
+                }
+                other => panic!("{attribute}={value:?}: unexpected {other:?}"),
+            }
+        }
+    }
+
+    /// Without `sts_issuer` on the provider, the endpoint and client decide.
+    #[tokio::test]
+    async fn idp_vault_issuer_is_checked_only_when_the_provider_names_one() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(exchanged())
+            .expect(1)
+            .mount(&server)
+            .await;
+        let token_url = format!("{}/token", server.uri());
+        let plugin = build_with_token_url(&token_url);
+        let mut identity = idp_vault_identity(&token_url, "ema");
+        identity.attributes.insert(
+            SUBJECT_TOKEN_ISSUER_ATTR.to_owned(),
+            "https://any-idp.example".to_owned(),
+        );
+        CredentialIssuer::issue(&plugin, &identity, "notion", &json!({}))
+            .await
+            .expect("exchanged");
+    }
+
+    #[tokio::test]
+    async fn unsupported_subject_token_type_attribute_is_refused_before_http() {
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let plugin = build_with_token_url(&format!("{}/token", server.uri()));
+        let mut identity = identity_with_subject("tok");
+        identity.attributes.insert(
+            SUBJECT_TOKEN_TYPE_ATTR.to_owned(),
+            "urn:example:custom".into(),
+        );
+        let err = CredentialIssuer::issue(&plugin, &identity, "notion", &json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CredentialError::Misconfigured { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn redirect_from_the_sts_is_not_followed() {
+        let server = MockServer::start().await;
+        Mock::given(path("/token"))
+            .respond_with(ResponseTemplate::new(307).insert_header("location", "/collector"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/collector"))
+            .respond_with(exchanged())
+            .expect(0)
+            .mount(&server)
+            .await;
+        let plugin = build_with_token_url(&format!("{}/token", server.uri()));
+        let err =
+            CredentialIssuer::issue(&plugin, &identity_with_subject("tok"), "notion", &json!({}))
+                .await
+                .unwrap_err();
+        match err {
+            CredentialError::Misconfigured { reason } => {
+                assert!(reason.contains("redirects are not followed"), "{reason}");
+                assert!(reason.contains("configure the final URL"), "{reason}");
+                assert!(!reason.contains("/collector"), "{reason}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn missing_subject_token_is_misconfigured() {
         // No live endpoint needed — the check happens before any HTTP.
         let plugin = build_with_token_url("https://example.com/token");
@@ -543,8 +1144,8 @@ mod tests {
 
     #[tokio::test]
     async fn non_verified_identity_is_not_authorized() {
-        // L-44: on-behalf-of token exchange requires a Verified caller.
-        // A non-verified identity with a populated subject token must be
+        // On-behalf-of token exchange requires a Verified caller. A
+        // non-verified identity with a populated subject token must be
         // refused before any STS call — the check precedes HTTP.
         let plugin = build_with_token_url("https://example.com/token");
         let mut identity = identity_with_subject("caller-bearer-xyz");
@@ -639,15 +1240,17 @@ mod tests {
     }
 
     /// Build a plugin with NO exact providers — only a target template
-    /// whose audience/resource expand `{target}`.
+    /// whose audience/resource expand the target.
     fn build_template_with_token_url(url: &str) -> OAuthTokenExchangePlugin {
         let cfg = json!({
             "target_template": {
-                "allowed_targets": ["srv-*"],
+                "allowed_targets": ["srv-*", "com.acme/*"],
                 "token_url": url,
                 "client_id": "mcpg-fleet",
-                "audience_template": "https://{target}.mcp.example.com",
-                "resource_template": "https://{target}.mcp.example.com/mcp"
+                "audience_template": "https://{target_slug}.mcp.example.com",
+                "resource_template": "https://{target_slug}.mcp.example.com/mcp",
+                "allow_insecure_http": true,
+                "allow_private_network": true
             }
         });
         OAuthTokenExchangePlugin::from_config_json(&cfg.to_string())
@@ -659,10 +1262,10 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/token"))
             .and(body_string_contains(
-                "audience=https%3A%2F%2Fsrv-crm.mcp.example.com",
+                "audience=https%3A%2F%2Fcom-acme-crm.mcp.example.com",
             ))
             .and(body_string_contains(
-                "resource=https%3A%2F%2Fsrv-crm.mcp.example.com%2Fmcp",
+                "resource=https%3A%2F%2Fcom-acme-crm.mcp.example.com%2Fmcp",
             ))
             .and(body_string_contains("client_id=mcpg-fleet"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -676,7 +1279,7 @@ mod tests {
         let cred = CredentialIssuer::issue(
             &plugin,
             &identity_with_subject("caller-bearer-xyz"),
-            "srv-crm",
+            "com.acme/crm",
             &json!({}),
         )
         .await
