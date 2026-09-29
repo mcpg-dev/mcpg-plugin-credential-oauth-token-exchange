@@ -118,7 +118,8 @@ pub struct TokenExchangeTargetTemplate {
     #[serde(default)]
     pub key_id: Option<String>,
 
-    /// Client assertion algorithm. Default RS256.
+    /// Client assertion algorithm. Default: the one the key type implies
+    /// (RSA: RS256, P-256: ES256, P-384: ES384, Ed25519: EdDSA).
     #[serde(default)]
     pub signing_alg: Option<SigningAlg>,
 
@@ -299,7 +300,8 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub key_id: Option<String>,
 
-    /// Client assertion algorithm. Default RS256.
+    /// Client assertion algorithm. Default: the one the key type implies
+    /// (RSA: RS256, P-256: ES256, P-384: ES384, Ed25519: EdDSA).
     #[serde(default)]
     pub signing_alg: Option<SigningAlg>,
 
@@ -500,7 +502,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const RSA_PRIV: &str = include_str!("../tests/fixtures/rsa_priv.pem");
+    const RSA_PRIV: &str = include_str!("testdata/rsa_priv.pem");
+    const EC_PRIV: &str = include_str!("testdata/ec_priv.pem");
+    const EC_P384_PRIV: &str = include_str!("testdata/ec_p384_priv.pem");
+    const ED_PRIV: &str = include_str!("testdata/ed25519_priv.pem");
 
     fn minimal() -> serde_json::Value {
         json!({
@@ -640,6 +645,38 @@ mod tests {
             other => panic!("unexpected: {other}"),
         }
         v["providers"]["notion"]["sts_issuer"] = json!("https://sts.example.com");
+        assert!(TokenExchangeConfig::parse(&v.to_string()).is_ok());
+    }
+
+    #[test]
+    fn signing_alg_defaults_to_the_key_type() {
+        for key in [RSA_PRIV, EC_PRIV, EC_P384_PRIV, ED_PRIV] {
+            let mut v = minimal();
+            v["providers"]["notion"]["client_auth"] = json!("private_key_jwt");
+            v["providers"]["notion"]["private_key"] = json!(key);
+            if let Err(err) = TokenExchangeConfig::parse(&v.to_string()) {
+                panic!("{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn signing_alg_the_key_cannot_sign_is_refused() {
+        let mut v = minimal();
+        v["providers"]["notion"]["client_auth"] = json!("private_key_jwt");
+        v["providers"]["notion"]["private_key"] = json!(EC_P384_PRIV);
+        v["providers"]["notion"]["signing_alg"] = json!("ES256");
+        match parse_err(&v) {
+            ConfigError::ClientAuth { reason, .. } => {
+                assert!(
+                    reason.contains("private_key cannot sign ES256: expected a P-256 key"),
+                    "{reason}"
+                );
+                assert!(!reason.contains("BEGIN"), "{reason}");
+            }
+            other => panic!("unexpected: {other}"),
+        }
+        v["providers"]["notion"]["signing_alg"] = json!("ES384");
         assert!(TokenExchangeConfig::parse(&v.to_string()).is_ok());
     }
 

@@ -101,13 +101,14 @@ at **import / listen** (no caller) the upstream is listed anonymously, like
 | `private_key_jwt` | `client_id`, `client_assertion_type` and a signed `client_assertion` (RFC 7523 §2.2) | `client_id`, `private_key`; no `client_secret` |
 
 For `private_key_jwt`, `private_key` is a PKCS#8 PEM (PKCS#1 also works for
-RSA) sourced with `${secret.NAME}` or `${env.X}`; `signing_alg` is `RS256`
-(default), `RS384`, `RS512`, `PS256`, `PS384`, `PS512`, `ES256`, `ES384` or
-`EdDSA`; `key_id` sets the `kid` header; `assertion_audience` is
-`token_endpoint` (default) or `issuer`, which needs `sts_issuer`. Each
-assertion is freshly signed with `iss` = `sub` = the client id, a new `jti`,
-and a two-minute lifetime. A key that does not match `signing_alg` refuses to
-load.
+RSA) sourced with `${secret.NAME}` or `${env.X}`; `signing_alg` is `RS256`,
+`RS384`, `RS512`, `PS256`, `PS384`, `PS512`, `ES256`, `ES384` or `EdDSA`, and
+unset it is the one the key type implies (RSA: `RS256`, P-256: `ES256`,
+P-384: `ES384`, Ed25519: `EdDSA`); `key_id` sets the `kid` header;
+`assertion_audience` is `token_endpoint` (default) or `issuer`, which needs
+`sts_issuer`. Each assertion is freshly signed with `iss` = `sub` = the client
+id, a new `jti`, and a two-minute lifetime. A `signing_alg` the key cannot sign
+with, or a key of another type, refuses to load.
 
 ## Egress policy
 

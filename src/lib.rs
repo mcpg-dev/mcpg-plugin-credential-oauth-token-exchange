@@ -634,10 +634,10 @@ mod tests {
     use wiremock::matchers::{any, body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-    const RSA_PRIV: &str = include_str!("../tests/fixtures/rsa_priv.pem");
-    const RSA_PUB: &str = include_str!("../tests/fixtures/rsa_pub.pem");
-    const EC_PRIV: &str = include_str!("../tests/fixtures/ec_priv.pem");
-    const EC_PUB: &str = include_str!("../tests/fixtures/ec_pub.pem");
+    const RSA_PRIV: &str = include_str!("testdata/rsa_priv.pem");
+    const RSA_PUB: &str = include_str!("testdata/rsa_pub.pem");
+    const EC_PRIV: &str = include_str!("testdata/ec_priv.pem");
+    const EC_PUB: &str = include_str!("testdata/ec_pub.pem");
 
     /// Identity carrying a subject token in `attributes` — what federation
     /// `oauth_impersonation` builds from the inbound caller bearer.
@@ -845,6 +845,32 @@ mod tests {
             Algorithm::ES256,
             &DecodingKey::from_ec_pem(EC_PUB.as_bytes()).unwrap(),
             "https://sts.example.com",
+        );
+    }
+
+    #[tokio::test]
+    async fn private_key_jwt_without_signing_alg_signs_with_the_key_type() {
+        let server = MockServer::start().await;
+        Mock::given(path("/token"))
+            .respond_with(exchanged())
+            .expect(1)
+            .mount(&server)
+            .await;
+        let token_url = format!("{}/token", server.uri());
+        let mut cfg = notion_config(&token_url);
+        let notion = cfg["providers"]["notion"].as_object_mut().unwrap();
+        notion.remove("client_secret");
+        notion.insert("client_auth".into(), json!("private_key_jwt"));
+        notion.insert("private_key".into(), json!(EC_PRIV));
+        let plugin = OAuthTokenExchangePlugin::from_config_json(&cfg.to_string());
+        CredentialIssuer::issue(&plugin, &identity_with_subject("tok"), "notion", &json!({}))
+            .await
+            .unwrap();
+        decode_assertion(
+            &form_sent(&server).await,
+            Algorithm::ES256,
+            &DecodingKey::from_ec_pem(EC_PUB.as_bytes()).unwrap(),
+            &token_url,
         );
     }
 
